@@ -1,10 +1,10 @@
-# <your project's name>
+# Volume kebab
 
 <!-- This README is the front door of your project: the gallery shows its first lines. -->
 
-## what it is
+## what it this
 
-<one or two sentences: what is your evil input?>
+This is an extremely evil kebab meat that gets shaved by you, an evil person. But sometimes you get too much meat, the you get to 
 
 ## what input it collects
 
