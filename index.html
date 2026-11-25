@@ -3,44 +3,389 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>my evil input</title>
+<title>doner volume</title>
 <style>
-  /* Everything you make goes inside #stage: exactly 800 × 400 pixels. The gallery shows
-     this box (shrunk to fit), so anything outside it won't be seen. */
+  /* Everything lives inside #stage: exactly 800 × 400 pixels. */
   html, body { margin: 0; background: #292b47; color: #eceae3; font: 16px/1.5 ui-monospace, Menlo, Consolas, monospace; }
   #stage {
     width: 800px; height: 400px; overflow: hidden; position: relative;
-    display: grid; place-items: center; text-align: center;
     background: #23243d;
+    cursor: none; user-select: none; -webkit-user-select: none; touch-action: none;
   }
-
-  /* ---- the example below: delete it and build your own ---- */
-  .vol { font-size: 64px; margin: 0; }
-  button { font: inherit; color: inherit; background: #3f4168; border: 0; border-radius: 6px; padding: .6rem 1.2rem; cursor: pointer; }
-  .hint { color: #8d8aa6; font-size: 14px; }
+  #cv { position: absolute; inset: 0; width: 800px; height: 400px; }
+  #shears { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; display: none; }
 </style>
 </head>
 <body>
 <div id="stage">
-  <!-- example evil input: volume you have to pump up by hand, and it leaks back down -->
-  <div>
-    <p class="vol"><span id="vol">0</span>%</p>
-    <button id="pump">pump volume</button>
-    <p class="hint">it leaks. keep pumping.</p>
-  </div>
+  <canvas id="cv"></canvas>
+  <!-- the kebab shears: the blade tips (x=2, y=20) sit exactly on the cursor -->
+  <svg id="shears" width="100" height="40" viewBox="0 0 100 40">
+    <g id="bladeA">
+      <path d="M56 20 L74 28" stroke="#c0392b" stroke-width="5" stroke-linecap="round"/>
+      <circle cx="83" cy="31" r="8" fill="none" stroke="#c0392b" stroke-width="5"/>
+      <path d="M57 16 L2 20 L57 22 Z" fill="#dfe3ec" stroke="#8a909e" stroke-width="1"/>
+    </g>
+    <g id="bladeB">
+      <path d="M56 20 L74 12" stroke="#a93226" stroke-width="5" stroke-linecap="round"/>
+      <circle cx="83" cy="9" r="8" fill="none" stroke="#a93226" stroke-width="5"/>
+      <path d="M57 24 L2 20 L57 18 Z" fill="#c9ceda" stroke="#8a909e" stroke-width="1"/>
+    </g>
+    <circle cx="56" cy="20" r="3" fill="#4a4c5e"/>
+  </svg>
 </div>
 <script>
-  // the example: delete this too
-  let volume = 0;
-  const out = document.getElementById('vol');
-  document.getElementById('pump').addEventListener('click', () => {
-    volume = Math.min(100, volume + 7);
-    out.textContent = Math.round(volume);
+  // ---------------------------------------------------------------------------
+  // doner volume: the volume IS the doner.
+  //  - hover the shears over the meat and the spit spins faster and the meat
+  //    grows back (volume goes up, faster the longer you hover)
+  //  - click to snip: shaves meat off (volume goes down), pieces fly onto the plate
+  //  - a full plate gets rolled into a wrap and served on the shelf
+  //  - the sizzle you hear is played at the current volume
+  // ---------------------------------------------------------------------------
+  const W = 800, H = 400;
+  const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  const stage = document.getElementById('stage');
+  const cv = document.getElementById('cv');
+  cv.width = W * dpr; cv.height = H * dpr;
+  const ctx = cv.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const shears = document.getElementById('shears');
+  const bladeA = document.getElementById('bladeA');
+  const bladeB = document.getElementById('bladeB');
+
+  // geometry
+  const CX = 250, Y0 = 62, Y1 = 322;          // doner centre line, top and bottom of the meat
+  const PLATE = { x: 615, y: 356 };
+  const WRAP_AT = 24;                         // pieces on the plate before they become a wrap
+
+  // state
+  let volume = 35;
+  let frame = 0, frameTimer = 0;
+  let mouse = { x: -999, y: -999, in: false };
+  let onMeat = false, hoverMs = 0, growTimer = 0;
+  let shavedTotal = 0, wraps = 0;
+  let pile = [], flying = [], floaters = [];
+  let wrapAnim = null;
+  let renderedVol = -1;
+
+  const hash = (a, b) => { const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return s - Math.floor(s); };
+
+  // ---- the two doner "images" (rendered into offscreen canvases, swapped to fake rotation)
+  function makeLayer() {
+    const c = document.createElement('canvas');
+    c.width = W * dpr; c.height = H * dpr;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.scale(dpr, dpr);
+    return { c, g };
+  }
+  const frames = [makeLayer(), makeLayer()];
+
+  function radiusAt(t, v) {
+    const rt = 8 + 124 * v, rb = 6 + 50 * v;
+    return rt + (rb - rt) * t + 12 * v * Math.sin(Math.PI * t);
+  }
+
+  function drawMeat(g, v, f) {
+    g.clearRect(0, 0, W, H);
+    const N = 52, L = [], R = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N, y = Y0 + (Y1 - Y0) * t, r = radiusAt(t, v);
+      L.push([CX - r, y]); R.push([CX + r, y]);
+    }
+    const rTop = radiusAt(0, v), rBot = radiusAt(1, v);
+    const shape = () => {
+      g.beginPath();
+      g.moveTo(L[0][0], L[0][1]);
+      for (const p of L) g.lineTo(p[0], p[1]);
+      g.ellipse(CX, Y1, rBot, rBot * 0.2, 0, Math.PI, 0, true);
+      for (let i = N; i >= 0; i--) g.lineTo(R[i][0], R[i][1]);
+      g.ellipse(CX, Y0, rTop, rTop * 0.2, 0, 0, Math.PI, true);
+      g.closePath();
+    };
+
+    // body with round shading
+    const rMax = radiusAt(0.25, v) + 2;
+    const gr = g.createLinearGradient(CX - rMax, 0, CX + rMax, 0);
+    gr.addColorStop(0, '#5a260c'); gr.addColorStop(0.22, '#a4501f');
+    gr.addColorStop(0.5, '#c97a3c'); gr.addColorStop(0.8, '#8a411c'); gr.addColorStop(1, '#3d1a0a');
+    shape(); g.fillStyle = gr; g.fill();
+
+    g.save(); shape(); g.clip();
+    // stacked meat layers
+    g.lineWidth = 1.2; g.strokeStyle = 'rgba(60,25,8,.35)';
+    for (let y = Y0 + 6; y < Y1 + 10; y += 7) {
+      const r = radiusAt(Math.min(1, (y - Y0) / (Y1 - Y0)), v);
+      g.beginPath(); g.moveTo(CX - r, y); g.quadraticCurveTo(CX, y + r * 0.4, CX + r, y); g.stroke();
+    }
+    // char marks + fat specks; frame f is shifted half a step -> looks like it turns
+    const K = 11;
+    for (let j = 0, y = Y0 + 8; y < Y1; y += 12, j++) {
+      const r = radiusAt((y - Y0) / (Y1 - Y0), v);
+      for (let k = 0; k < K; k++) {
+        const th = k * 2 * Math.PI / K + f * Math.PI / K + j * 0.83;
+        const c = Math.cos(th);
+        if (c < 0.1) continue;
+        const x = CX + Math.sin(th) * r, yy = y + c * r * 0.2;
+        const w = (3 + 5 * c) * (0.6 + 0.4 * hash(j, k)), h = 1.6 + 2 * hash(k, j);
+        g.fillStyle = hash(j * 7, k) > 0.8 ? `rgba(240,205,155,${0.6 * c})` : `rgba(40,15,5,${0.55 * c})`;
+        g.beginPath(); g.ellipse(x, yy, w, h, 0, 0, Math.PI * 2); g.fill();
+      }
+    }
+    g.restore();
+
+    // cut top
+    g.beginPath(); g.ellipse(CX, Y0, rTop, rTop * 0.2, 0, 0, Math.PI * 2);
+    g.fillStyle = '#d08a50'; g.fill();
+    g.strokeStyle = 'rgba(110,50,20,.5)'; g.lineWidth = 1;
+    for (let s = 0.75; s > 0.1; s -= 0.22) { g.beginPath(); g.ellipse(CX, Y0, rTop * s, rTop * 0.2 * s, 0, 0, Math.PI * 2); g.stroke(); }
+    g.strokeStyle = '#5a2a10'; g.lineWidth = 1.5;
+    g.beginPath(); g.ellipse(CX, Y0, rTop, rTop * 0.2, 0, 0, Math.PI * 2); g.stroke();
+  }
+
+  function renderFrames() {
+    renderedVol = Math.round(volume);
+    const v = renderedVol / 100;
+    drawMeat(frames[0].g, v, 0);
+    drawMeat(frames[1].g, v, 1);
+  }
+
+  // only the non-transparent pixels of the current doner image count
+  function hitMeat(x, y) {
+    if (x < 0 || y < 0 || x >= W || y >= H) return false;
+    const d = frames[frame].g.getImageData(Math.floor(x * dpr), Math.floor(y * dpr), 1, 1).data;
+    return d[3] > 40;
+  }
+
+  // ---- input
+  function toStage(e) {
+    const r = stage.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+  }
+  function placeShears() {
+    shears.style.display = mouse.in ? 'block' : 'none';
+    shears.style.transform = `translate(${mouse.x - 2}px, ${mouse.y - 20}px)`;
+  }
+  function setOpen(deg) {
+    bladeA.setAttribute('transform', `rotate(${deg} 56 20)`);
+    bladeB.setAttribute('transform', `rotate(${-deg} 56 20)`);
+  }
+  setOpen(14);
+
+  stage.addEventListener('pointermove', e => { Object.assign(mouse, toStage(e), { in: true }); placeShears(); });
+  stage.addEventListener('pointerenter', e => { Object.assign(mouse, toStage(e), { in: true }); placeShears(); });
+  stage.addEventListener('pointerleave', () => { mouse.in = false; placeShears(); });
+  stage.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    Object.assign(mouse, toStage(e), { in: true }); placeShears();
+    startAudio();
+    setOpen(0);
+    snip();
   });
-  setInterval(() => {
-    volume = Math.max(0, volume - 1);
-    out.textContent = Math.round(volume);
-  }, 120);
+  window.addEventListener('pointerup', () => setOpen(14));
+
+  function snip() {
+    if (!hitMeat(mouse.x, mouse.y) || volume <= 0) return;
+    volume = Math.max(0, volume - 2);
+    floaters.push({ x: mouse.x - 10, y: mouse.y - 14, text: '−2', col: '#9fd88a', t: 0 });
+    for (let i = 0; i < 2; i++) {
+      const n = pile.length + flying.length;
+      const spread = Math.max(14, 80 - n * 2.4);
+      const tx = PLATE.x + (Math.random() * 2 - 1) * spread;
+      const ty = PLATE.y - 4 - Math.min(38, n * 1.5) * (1 - Math.abs(tx - PLATE.x) / (spread + 12)) - Math.random() * 3;
+      const T = 0.55 + Math.random() * 0.25, G = 900;
+      flying.push({
+        x0: mouse.x, y0: mouse.y, tx, ty, T, G, t: 0,
+        vx: (tx - mouse.x) / T, vy: (ty - mouse.y) / T - 0.5 * G * T,
+        rot: Math.random() * Math.PI, spin: (Math.random() * 2 - 1) * 12,
+        len: 8 + Math.random() * 7,
+        col: ['#8f4520', '#a8582a', '#6e3214', '#c47236'][Math.floor(Math.random() * 4)],
+      });
+      shavedTotal++;
+    }
+  }
+
+  // ---- sound: sizzling at the current volume
+  let audio = null;
+  function startAudio() {
+    if (audio) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ac = new AC();
+    const len = ac.sampleRate * 2, buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+    let pop = 0;
+    for (let i = 0; i < len; i++) {
+      if (Math.random() < 0.0012) pop = 0.6 + Math.random() * 0.6;
+      d[i] = (Math.random() * 2 - 1) * (0.18 + pop);
+      pop *= 0.985;
+    }
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+    const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1800;
+    const gain = ac.createGain(); gain.gain.value = 0;
+    src.connect(hp).connect(gain).connect(ac.destination);
+    src.start();
+    audio = { ac, gain };
+  }
+
+  // ---- update
+  function update(dt) {
+    if (Math.round(volume) !== renderedVol) renderFrames();
+
+    onMeat = mouse.in && hitMeat(mouse.x, mouse.y);
+    if (onMeat) {
+      hoverMs += dt; growTimer += dt;
+      const interval = Math.max(90, 380 - hoverMs * 0.06);   // grows faster the longer you linger
+      while (growTimer >= interval) {
+        growTimer -= interval;
+        if (volume < 100) {
+          volume = Math.min(100, volume + 1);
+          floaters.push({ x: mouse.x + 12, y: mouse.y - 8, text: '+1', col: '#ff8a5c', t: 0 });
+        }
+      }
+    } else {
+      hoverMs = Math.max(0, hoverMs - dt * 3);
+      growTimer = 0;
+    }
+
+    const spinPeriod = Math.max(45, 320 - hoverMs * 0.06 - volume * 1.2);
+    frameTimer += dt;
+    if (frameTimer >= spinPeriod) { frameTimer = 0; frame ^= 1; }
+
+    for (const p of flying) { p.t += dt / 1000; }
+    for (const p of flying.filter(p => p.t >= p.T)) {
+      pile.push({ x: p.tx, y: p.ty, rot: p.rot + p.spin * p.T, len: p.len, col: p.col });
+    }
+    flying = flying.filter(p => p.t < p.T);
+
+    if (!wrapAnim && pile.length >= WRAP_AT) wrapAnim = { t: 0, pieces: pile.splice(0) };
+    if (wrapAnim) {
+      wrapAnim.t += dt / 1000;
+      if (wrapAnim.t >= 1.6) { wraps++; wrapAnim = null; }
+    }
+
+    for (const f of floaters) f.t += dt / 1000;
+    floaters = floaters.filter(f => f.t < 0.8);
+
+    if (audio) audio.gain.gain.setTargetAtTime(Math.pow(volume / 100, 1.5) * 0.35, audio.ac.currentTime, 0.05);
+  }
+
+  // ---- drawing
+  function drawPiece(p, x, y, s = 1) {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(p.rot); ctx.scale(s, s);
+    ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.roundRect(-p.len / 2, -2, p.len, 4, 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawWrap(x, y, s, a = -0.35) {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(a); ctx.scale(s, s);
+    ctx.fillStyle = '#8f4520'; ctx.beginPath(); ctx.ellipse(-15, 0, 5, 6.5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#6fae3c'; ctx.beginPath(); ctx.ellipse(-17, -4, 3, 2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#d8432f'; ctx.beginPath(); ctx.ellipse(-17, 3, 2.2, 2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#e9cf98'; ctx.strokeStyle = '#b8925a'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(-14, -7, 30, 14, 6); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = 'rgba(150,100,50,.6)';
+    for (const gx of [-5, 3, 11]) { ctx.beginPath(); ctx.moveTo(gx - 3, -5); ctx.lineTo(gx + 3, 5); ctx.stroke(); }
+    ctx.restore();
+  }
+
+  const shelfSlot = i => ({ x: 540 + i * 34, y: 182 });
+
+  function draw(now) {
+    ctx.clearRect(0, 0, W, H);
+
+    // counter
+    ctx.fillStyle = '#1b1c30'; ctx.fillRect(0, 372, W, 28);
+
+    // heater behind the doner
+    ctx.fillStyle = '#2e1a1c'; ctx.beginPath(); ctx.roundRect(30, 50, 34, 284, 6); ctx.fill();
+    for (let i = 0; i < 9; i++) {
+      const a = 0.55 + 0.35 * Math.sin(now / 180 + i * 1.7);
+      ctx.fillStyle = `rgba(255,${90 + 40 * a | 0},40,${a})`;
+      ctx.fillRect(36, 60 + i * 30, 22, 10);
+    }
+    const glow = ctx.createLinearGradient(64, 0, 200, 0);
+    glow.addColorStop(0, 'rgba(255,110,40,.18)'); glow.addColorStop(1, 'rgba(255,110,40,0)');
+    ctx.fillStyle = glow; ctx.fillRect(64, 50, 140, 284);
+
+    // drip tray + spit
+    ctx.fillStyle = '#34365a'; ctx.beginPath(); ctx.ellipse(CX, 368, 74, 10, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#55577e'; ctx.lineWidth = 1.5; ctx.stroke();
+    const spit = ctx.createLinearGradient(CX - 3, 0, CX + 3, 0);
+    spit.addColorStop(0, '#6b6e86'); spit.addColorStop(0.5, '#d9dbe6'); spit.addColorStop(1, '#6b6e86');
+    ctx.fillStyle = spit; ctx.fillRect(CX - 3, 24, 6, 344);
+
+    // the meat (one of the two images)
+    ctx.drawImage(frames[frame].c, 0, 0, W, H);
+    ctx.fillStyle = spit; ctx.fillRect(CX - 3, 24, 6, Y0 - 24);
+    ctx.fillStyle = '#9a9db2'; ctx.beginPath(); ctx.arc(CX, 24, 5, 0, Math.PI * 2); ctx.fill();
+
+    // plate + pile
+    ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.beginPath(); ctx.ellipse(PLATE.x, PLATE.y + 6, 122, 22, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#e8e4da'; ctx.beginPath(); ctx.ellipse(PLATE.x, PLATE.y, 120, 22, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#d6d1c4'; ctx.strokeStyle = '#c2bcae'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.ellipse(PLATE.x, PLATE.y, 94, 15, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    for (const p of pile) drawPiece(p, p.x, p.y);
+
+    // plate full -> roll it into a wrap -> serve it on the shelf
+    if (wrapAnim) {
+      const t = wrapAnim.t;
+      if (t < 0.6) {
+        const e = (t / 0.6) ** 2;
+        for (const p of wrapAnim.pieces) drawPiece(p, p.x + (PLATE.x - p.x) * e, p.y + (PLATE.y - 16 - p.y) * e, 1 - 0.6 * e);
+      } else if (t < 1.0) {
+        const k = (t - 0.6) / 0.4, back = 1 + 2.7 * (k - 1) ** 3 + 1.7 * (k - 1) ** 2;
+        drawWrap(PLATE.x, PLATE.y - 16, 0.4 + 1.6 * back);
+      } else {
+        const k = Math.min(1, (t - 1) / 0.6), e = 1 - (1 - k) ** 3, s = shelfSlot(Math.min(wraps, 5));
+        drawWrap(PLATE.x + (s.x - PLATE.x) * e, PLATE.y - 16 + (s.y - PLATE.y + 16) * e - Math.sin(Math.PI * k) * 60, 2 - e);
+      }
+    }
+
+    // flying shavings
+    for (const p of flying) {
+      drawPiece({ ...p, rot: p.rot + p.spin * p.t }, p.x0 + p.vx * p.t, p.y0 + p.vy * p.t + 0.5 * p.G * p.t * p.t);
+    }
+
+    // readout
+    ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+    ctx.fillStyle = '#8d8aa6'; ctx.font = '13px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillText('VOLUME', 520, 44);
+    ctx.fillStyle = '#eceae3'; ctx.font = 'bold 52px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillText(`${Math.round(volume)}%`, 518, 96);
+    ctx.fillStyle = '#3f4168'; ctx.beginPath(); ctx.roundRect(520, 108, 240, 10, 5); ctx.fill();
+    ctx.fillStyle = '#e07a3a'; ctx.beginPath(); ctx.roundRect(520, 108, Math.max(0.01, 240 * volume / 100), 10, 5); ctx.fill();
+    ctx.fillStyle = '#8d8aa6'; ctx.font = '13px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillText(`shaved ${shavedTotal} · served ${wraps} wrap${wraps === 1 ? '' : 's'}`, 520, 142);
+
+    // shelf of served wraps
+    ctx.fillStyle = '#3f4168'; ctx.fillRect(520, 196, 250, 3);
+    for (let i = 0; i < Math.min(wraps, 6); i++) { const s = shelfSlot(i); drawWrap(s.x, s.y, 1); }
+    if (wraps > 6) { ctx.fillStyle = '#eceae3'; ctx.fillText(`+${wraps - 6}`, 742, 187); }
+
+    ctx.fillStyle = '#8d8aa6';
+    ctx.fillText('hover the meat: it grows back', 520, 232);
+    ctx.fillText('click: snip it down', 520, 250);
+
+    // +1 / −2 popups
+    ctx.font = 'bold 14px ui-monospace, Menlo, Consolas, monospace';
+    for (const f of floaters) {
+      ctx.globalAlpha = 1 - f.t / 0.8; ctx.fillStyle = f.col;
+      ctx.fillText(f.text, f.x, f.y - 30 * f.t);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- loop
+  renderFrames();
+  let last = performance.now();
+  function tick(now) {
+    const dt = Math.min(50, now - last); last = now;
+    update(dt); draw(now);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
 </script>
 </body>
 </html>
